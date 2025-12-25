@@ -65,6 +65,50 @@ exports.initializeUpload = async (req, res) => {
     }
 };
 
+exports.uploadChunk = async (req, res) => {
+    const { upload_id, chunk_index } = req.params;
+
+    const chunkIndex = parseInt(chunk_index);
+    if (isNaN(chunkIndex)) {
+        return res.status(400).json({ error: 'Invalid chunk index' });
+    }
+
+    const chunkDir = path.join(__dirname, '../../uploads/temp', upload_id);
+    const chunkPath = path.join(chunkDir, `${chunkIndex}`);
+
+    try {
+        await fs.promises.mkdir(chunkDir, { recursive: true });
+
+        const writeStream = fs.createWriteStream(chunkPath);
+
+        await new Promise((resolve, reject) => {
+            req.pipe(writeStream);
+            req.on('end', resolve);
+            req.on('error', reject);
+            writeStream.on('error', reject);
+        });
+
+        // Update DB
+        const connection = await pool.getConnection();
+        try {
+            await connection.query(
+                `INSERT INTO chunks (upload_id, chunk_index, status, received_at) 
+               VALUES (?, ?, 'RECEIVED', CURRENT_TIMESTAMP)
+               ON DUPLICATE KEY UPDATE status = 'RECEIVED', received_at = CURRENT_TIMESTAMP`,
+                [upload_id, chunkIndex]
+            );
+        } finally {
+            connection.release();
+        }
+
+        res.status(200).json({ message: 'Chunk received' });
+
+    } catch (error) {
+        console.error('Upload chunk error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+};
+
 exports.finalizeUpload = async (req, res) => {
     const { upload_id } = req.body;
 
@@ -78,7 +122,7 @@ exports.finalizeUpload = async (req, res) => {
         try {
             // 1. Check status
             const [rows] = await connection.query(
-                'SELECT status, filename FROM uploads WHERE id = ?',
+                'SELECT status, filename, total_chunks FROM uploads WHERE id = ?',
                 [upload_id]
             );
 
@@ -91,16 +135,41 @@ exports.finalizeUpload = async (req, res) => {
                 return res.status(200).json({ message: 'Upload already completed' });
             }
 
-            // 2. File Handling
-            const filePath = path.join(__dirname, '../../uploads', `${upload_id}.zip`);
+            // 2. Assemble File
+            const chunkDir = path.join(__dirname, '../../uploads/temp', upload_id);
+            const finalPath = path.join(__dirname, '../../uploads', `${upload_id}.zip`);
 
-            if (!fs.existsSync(filePath)) {
-                return res.status(400).json({ error: 'File not found on server' });
+            const [chunkRows] = await connection.query(
+                'SELECT COUNT(*) as count FROM chunks WHERE upload_id = ? AND status = "RECEIVED"',
+                [upload_id]
+            );
+
+            if (chunkRows[0].count !== upload.total_chunks) {
+                return res.status(400).json({ error: 'Not all chunks received' });
             }
+
+            await fs.promises.mkdir(path.dirname(finalPath), { recursive: true });
+            const writeStream = fs.createWriteStream(finalPath);
+
+            for (let i = 0; i < upload.total_chunks; i++) {
+                const chunkPath = path.join(chunkDir, `${i}`);
+                if (!fs.existsSync(chunkPath)) {
+                    writeStream.close();
+                    throw new Error(`Missing chunk file ${i}`);
+                }
+                const data = fs.readFileSync(chunkPath);
+                writeStream.write(data);
+            }
+            writeStream.end();
+
+            await new Promise((resolve, reject) => {
+                writeStream.on('finish', resolve);
+                writeStream.on('error', reject);
+            });
 
             // 3. Hash Calculation
             const hash = crypto.createHash('sha256');
-            const stream = fs.createReadStream(filePath);
+            const stream = fs.createReadStream(finalPath);
 
             await new Promise((resolve, reject) => {
                 stream.on('data', chunk => hash.update(chunk));
@@ -113,12 +182,11 @@ exports.finalizeUpload = async (req, res) => {
             // 4. ZIP Inspection
             const filenames = [];
             await new Promise((resolve, reject) => {
-                yauzl.open(filePath, { lazyEntries: true }, (err, zipfile) => {
+                yauzl.open(finalPath, { lazyEntries: true }, (err, zipfile) => {
                     if (err) return reject(err);
 
                     zipfile.readEntry();
                     zipfile.on('entry', (entry) => {
-                        // Collect top level filenames
                         filenames.push(entry.fileName);
                         zipfile.readEntry();
                     });
@@ -134,6 +202,11 @@ exports.finalizeUpload = async (req, res) => {
                 'UPDATE uploads SET status = ?, final_hash = ? WHERE id = ?',
                 ['COMPLETED', finalHash, upload_id]
             );
+
+            // Cleanup
+            fs.rm(chunkDir, { recursive: true, force: true }, (err) => {
+                // ignore
+            });
 
             res.status(200).json({
                 message: 'Upload finalized',
